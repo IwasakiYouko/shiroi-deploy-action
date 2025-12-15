@@ -17,7 +17,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  PNPM_VERSION: 9.x.x
+  PNPM_VERSION: "^9"
   HASH_FILE: build_hash
 
 jobs:
@@ -37,6 +37,7 @@ jobs:
         run: |
           content=$(cat ${{ env.HASH_FILE }}) || true
           echo "hash_content=$content" >> "$GITHUB_OUTPUT"
+
   check:
     name: Check Should Rebuild
     runs-on: ubuntu-latest
@@ -90,17 +91,23 @@ jobs:
 
       - name: Checkout LFS objects
         run: git lfs checkout
+
       - uses: pnpm/action-setup@v2
         with:
           version: ${{ env.PNPM_VERSION }}
+
       - name: Use Node.js ${{ matrix.node-version }}
         uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
           cache: 'pnpm'
+
       - uses: jongwooo/next-cache@v1
+
       - name: Install dependencies
-        run: pnpm install
+        run: |
+          pnpm install --frozen-lockfile || pnpm install --no-frozen-lockfile
+
       - name: Build project
         run: |
           sh ./ci-release-build.sh
@@ -110,6 +117,7 @@ jobs:
       #     name: dist
       #     path: assets/release.zip
       #     retention-days: 7
+
       - name: Cache Build Artifacts
         id: cache-primes
         uses: actions/cache/save@v4
@@ -143,6 +151,7 @@ jobs:
           path: |
             assets
           key: ${{ github.run_number }}-release
+
       - name: Move assets to root
         run: mv assets/release.zip release.zip
 
@@ -159,7 +168,6 @@ jobs:
 
       - name: Exec deploy script with SSH
         uses: appleboy/ssh-action@master
-
         with:
           command_timeout: 5m
           host: ${{ secrets.HOST }}
@@ -172,7 +180,7 @@ jobs:
             set -e
             export NVM_DIR=~/.nvm #定义.nvm的安装目录，否则终端运行时明明安装了但找不到命令
             source ~/.nvm/nvm.sh #识别nvm命令，否则可能会报command not found
-            source $HOME/.bashrc 
+            source $HOME/.bashrc
             basedir=$HOME/mx-space/shiro #填写你自己希望的路径，因为我的后端文件在mx-space下，所以我希望我的shiro也在mx-space文件夹下，方便管理
             workdir=$basedir/${{ github.run_number }}
             mkdir -p $workdir
@@ -205,6 +213,7 @@ jobs:
           hash=${{ needs.build.outputs.sha_short }}
           # curl -X "POST" "https://mx.innei.in/api/v2/fn/shiro/new-version-hook" -H 'Content-Type: application/json' -d "{\"hash\": \"$hash\", \"key\": \"\"}"
           ${{ secrets.AFTER_DEPLOY_SCRIPT }}
+
   store:
     name: Store artifact commit version
     runs-on: ubuntu-latest
@@ -215,6 +224,7 @@ jobs:
         with:
           persist-credentials: false # otherwise, the token used is the GITHUB_TOKEN, instead of your personal token
           fetch-depth: 0 # otherwise, you will failed to push refs to dest repo
+
       # Get the commit version from the build job
       - name: Use outputs from build
         env:
@@ -223,17 +233,19 @@ jobs:
         run: |
           echo "SHA Short from build: $SHA_SHORT"
           echo "Branch from build: $BRANCH"
+
       - name: Write hash to file
         env:
           SHA_SHORT: ${{ needs.build.outputs.sha_short }}
-
         run: echo $SHA_SHORT > ${{ env.HASH_FILE }}
+
       - name: Commit files
         run: |
           git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
           git add ${{ env.HASH_FILE }}
           git commit -a -m "Update hash file"
+
       - name: Push changes
         uses: ad-m/github-push-action@master
         with:
