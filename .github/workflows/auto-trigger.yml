@@ -1,4 +1,4 @@
-name: Auto trigger deploy (upstream main commit or every 3 days, no commits)
+name: Auto trigger deploy (upstream change or every 3 days)
 
 on:
   schedule:
@@ -14,12 +14,12 @@ jobs:
   check-and-dispatch:
     runs-on: ubuntu-latest
     env:
-      # 对齐 deploy.yml
+      # 与 deploy.yml 对齐
       HASH_FILE: build_hash
       UPSTREAM_REPO: innei-dev/shiroi
       UPSTREAM_BRANCH: main
 
-      # 对齐你的 deploy 工作流文件名
+      # 你的部署工作流文件名（就是 .github/workflows/deploy.yml）
       DEPLOY_WORKFLOW_FILE: deploy.yml
 
       # 3 天
@@ -52,6 +52,7 @@ jobs:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           set -euo pipefail
+
           api="https://api.github.com/repos/${UPSTREAM_REPO}/commits/${UPSTREAM_BRANCH}"
           sha="$(curl -fsSL \
             -H "Authorization: token ${GH_PAT}" \
@@ -75,7 +76,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 取 deploy.yml 最近一次成功运行；如果没有成功运行记录，则退化取最近一次运行
           base="https://api.github.com/repos/${REPO}/actions/workflows/${DEPLOY_WORKFLOW_FILE}/runs"
           url_success="${base}?per_page=1&status=success"
           url_latest="${base}?per_page=1"
@@ -93,13 +93,11 @@ jobs:
           fi
 
           if [ -z "$created_at" ]; then
-            # 从未运行过
             echo "epoch=0" >> "$GITHUB_OUTPUT"
             echo "No previous deploy workflow runs found."
             exit 0
           fi
 
-          # Ubuntu 的 date 支持 -d
           epoch="$(date -d "$created_at" +%s)"
           echo "epoch=$epoch" >> "$GITHUB_OUTPUT"
           echo "Last deploy run created_at: $created_at (epoch=$epoch)"
@@ -112,13 +110,12 @@ jobs:
           local_hash="${{ steps.localhash.outputs.hash }}"
           upstream_hash="${{ steps.upstream.outputs.short }}"
           last_epoch="${{ steps.lastrun.outputs.epoch }}"
-
           now="$(date +%s)"
 
           should="false"
           reason="no-change-and-not-due"
 
-          # 1) 上游有变化 => 立刻触发
+          # 1) 上游有更新 => 触发
           if [ -z "$local_hash" ]; then
             should="true"
             reason="no-local-hash-first-run"
@@ -126,7 +123,7 @@ jobs:
             should="true"
             reason="upstream-changed"
           else
-            # 2) 上游无变化 => 距离上次 deploy 运行 >= 3 天则触发
+            # 2) 上游没更新 => 超过3天没部署则触发
             diff=$(( now - last_epoch ))
             if [ "$last_epoch" -eq 0 ] || [ "$diff" -ge "${FORCE_INTERVAL_SECONDS}" ]; then
               should="true"
@@ -140,7 +137,7 @@ jobs:
           echo "Decision: should=$should reason=$reason"
           echo "local_hash=$local_hash upstream_hash=$upstream_hash last_epoch=$last_epoch now=$now"
 
-      - name: Dispatch deploy workflow (repository_dispatch)
+      - name: Dispatch deploy.yml (repository_dispatch)
         if: steps.decide.outputs.should == 'true'
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
