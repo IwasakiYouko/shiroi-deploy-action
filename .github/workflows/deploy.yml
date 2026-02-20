@@ -1,12 +1,13 @@
 name: Build and Deploy
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: #增加了工作流的手动运行
   push:
     branches:
       - main
   # schedule:
   #   - cron: '0 3 * * *'
+
   repository_dispatch:
     types: [trigger-workflow]
 
@@ -20,23 +21,71 @@ env:
   HASH_FILE: build_hash
 
 jobs:
-  build:
-    name: Build artifact
+  prepare:
+    name: Prepare
     runs-on: ubuntu-latest
-
-    strategy:
-      matrix:
-        node-version: [20.x]
+    if: ${{ github.event.head_commit.message != 'Update hash file' }}
 
     outputs:
-      sha_short: ${{ steps.store.outputs.sha_short }}
-      branch: ${{ steps.store.outputs.branch }}
+      hash_content: ${{ steps.read_hash.outputs.hash_content }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Read HASH_FILE content
+        id: read_hash
+        run: |
+          content=$(cat ${{ env.HASH_FILE }}) || true
+          echo "hash_content=$content" >> "$GITHUB_OUTPUT"
+
+  check:
+    name: Check Should Rebuild
+    runs-on: ubuntu-latest
+    needs: prepare
+    outputs:
+      canceled: ${{ steps.use_content.outputs.canceled }}
 
     steps:
       - uses: actions/checkout@v4
         with:
-          repository: innei-dev/shiroi
-          token: ${{ secrets.GH_PAT }}
+          repository: innei-dev/shiroi #填写你需要访问的仓库，如开源版为innei/shiro
+          token: ${{ secrets.GH_PAT }} # `GH_PAT` is a secret that contains your PAT
+          fetch-depth: 0
+          lfs: true
+
+      - name: Use content from prev job and compare
+        id: use_content
+        env:
+          FILE_HASH: ${{ needs.prepare.outputs.hash_content }}
+        run: |
+          file_hash=$FILE_HASH
+          current_hash=$(git rev-parse --short HEAD)
+          echo "File Hash: $file_hash"
+          echo "Current Git Hash: $current_hash"
+          if [ "$file_hash" == "$current_hash" ]; then
+            echo "Hashes match. Stopping workflow."
+            echo "canceled=true" >> $GITHUB_OUTPUT
+          else
+            echo "Hashes do not match. Continuing workflow."
+          fi
+
+  build:
+    name: Build artifact
+    runs-on: ubuntu-latest
+    needs: check
+    if: ${{needs.check.outputs.canceled != 'true'}}
+
+    strategy:
+      matrix:
+        node-version: [20.x]
+    outputs:
+      sha_short: ${{ steps.store.outputs.sha_short }}
+      branch: ${{ steps.store.outputs.branch }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: innei-dev/shiroi #填写你需要访问的仓库，如开源版为innei/shiro
+          token: ${{ secrets.GH_PAT }} # `GH_PAT` is a secret that contains your PAT
           fetch-depth: 0
           lfs: true
 
@@ -51,7 +100,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
-          cache: pnpm
+          cache: 'pnpm'
 
       - uses: jongwooo/next-cache@v1
 
@@ -60,15 +109,14 @@ jobs:
           pnpm install --frozen-lockfile || pnpm install --no-frozen-lockfile
 
       - name: Build project
-        shell: bash
-        env:
-          SKIP_PUBLISH: "1"
         run: |
-          set -euo pipefail
-          test -f ./scripts/release.sh
-          chmod +x ./scripts/release.sh || true
-          ./scripts/release.sh
-          test -f assets/release.zip
+          sh ./ci-release-build.sh
+
+      # - uses: actions/upload-artifact@v4
+      #   with:
+      #     name: dist
+      #     path: assets/release.zip
+      #     retention-days: 7
 
       - name: Cache Build Artifacts
         id: cache-primes
@@ -90,21 +138,22 @@ jobs:
     name: Deploy artifact
     runs-on: ubuntu-latest
     needs: build
-
     steps:
+      # - name: Download artifact
+      #   uses: actions/download-artifact@v4
+      #   with:
+      #     name: dist
+
       - name: Restore cached Build Artifacts
         id: cache-primes-restore
         uses: actions/cache/restore@v4
         with:
-          path: assets
+          path: |
+            assets
           key: ${{ github.run_number }}-release
 
       - name: Move assets to root
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -f assets/release.zip
-          mv assets/release.zip release.zip
+        run: mv assets/release.zip release.zip
 
       - name: copy file via ssh password
         uses: appleboy/scp-action@v0.1.7
@@ -114,8 +163,8 @@ jobs:
           password: ${{ secrets.PASSWORD }}
           key: ${{ secrets.KEY }}
           port: ${{ secrets.PORT }}
-          source: release.zip
-          target: /tmp/shiro
+          source: 'release.zip'
+          target: '/tmp/shiro'
 
       - name: Exec deploy script with SSH
         uses: appleboy/ssh-action@master
@@ -126,12 +175,13 @@ jobs:
           password: ${{ secrets.PASSWORD }}
           key: ${{ secrets.KEY }}
           port: ${{ secrets.PORT }}
+          #script_stop: true 移除了改行指令，因为该指令已经停止使用了会提示但不影响，不改也行
           script: |
             set -e
-            export NVM_DIR=~/.nvm
-            source ~/.nvm/nvm.sh
+            export NVM_DIR=~/.nvm #定义.nvm的安装目录，否则终端运行时明明安装了但找不到命令
+            source ~/.nvm/nvm.sh #识别nvm命令，否则可能会报command not found
             source $HOME/.bashrc
-            basedir=$HOME/mx-space/shiro
+            basedir=$HOME/mx-space/shiro #填写你自己希望的路径，因为我的后端文件在mx-space下，所以我希望我的shiro也在mx-space文件夹下，方便管理
             workdir=$basedir/${{ github.run_number }}
             mkdir -p $workdir
             mkdir -p $basedir/.cache
@@ -140,11 +190,14 @@ jobs:
             cd $workdir
             unzip -qq -o $workdir/release.zip
             rm -rf $workdir/standalone/.env
-            ln -s $HOME/mx-space/shiro/.env $workdir/standalone/.env
+            ln -s $HOME/mx-space/shiro/.env $workdir/standalone/.env #你的.env文件路径，我存放在mx-space/shiro文件夹内，方便管理
             export NEXT_SHARP_PATH=$(npm root -g)/sharp
+            # copy workdir ecosystem.config.js to basedir if not exists
             if [ ! -f $basedir/ecosystem.config.js ]; then
               cp $workdir/standalone/ecosystem.config.js $basedir/ecosystem.config.js
             fi
+            # https://github.com/Unitech/pm2/issues/3054
+            # symlink workdir node entry file to basedir
             ln -sf $workdir/standalone/server.js $basedir/server.js
             mkdir -p $workdir/standalone/.next
             rm -rf $workdir/standalone/.next/cache
@@ -158,20 +211,21 @@ jobs:
       - name: After deploy script
         run: |
           hash=${{ needs.build.outputs.sha_short }}
+          # curl -X "POST" "https://mx.innei.in/api/v2/fn/shiro/new-version-hook" -H 'Content-Type: application/json' -d "{\"hash\": \"$hash\", \"key\": \"\"}"
           ${{ secrets.AFTER_DEPLOY_SCRIPT }}
 
   store:
     name: Store artifact commit version
     runs-on: ubuntu-latest
     needs: [deploy, build]
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          persist-credentials: false
-          fetch-depth: 0
+          persist-credentials: false # otherwise, the token used is the GITHUB_TOKEN, instead of your personal token
+          fetch-depth: 0 # otherwise, you will failed to push refs to dest repo
 
+      # Get the commit version from the build job
       - name: Use outputs from build
         env:
           SHA_SHORT: ${{ needs.build.outputs.sha_short }}
@@ -185,23 +239,14 @@ jobs:
           SHA_SHORT: ${{ needs.build.outputs.sha_short }}
         run: echo $SHA_SHORT > ${{ env.HASH_FILE }}
 
-      - name: Commit files (skip if no changes)
-        shell: bash
+      - name: Commit files
         run: |
-          set -e
           git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
           git add ${{ env.HASH_FILE }}
+          git commit -a -m "Update hash file"
 
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
-            exit 0
-          fi
-
-          git commit -m "Update hash file"
-
-      - name: Push changes (only if committed)
-        if: ${{ success() }}
+      - name: Push changes
         uses: ad-m/github-push-action@master
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
