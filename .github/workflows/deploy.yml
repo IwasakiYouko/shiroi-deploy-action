@@ -111,8 +111,9 @@ jobs:
         run: |
           pnpm install --frozen-lockfile || pnpm install --no-frozen-lockfile
 
-      # 关键修复：源码仓库没有 ./ci-release-build.sh
-      # 按源码 CI (.drone.yml) 的实际构建链路构建并产出 assets/release.zip
+      # NOTE: 保持你原有逻辑：构建阶段不写入/不复制 .env
+      # 运行时由服务器侧 ln -s "$HOME/mx-space/shiro/.env" 注入 standalone/.env
+
       - name: Build and package (produce assets/release.zip)
         env:
           NODE_OPTIONS: --max_old_space_size=4096
@@ -121,8 +122,14 @@ jobs:
         run: |
           set -e
           pnpm --filter @shiro/web build:ci
+
           cd apps/web
           chmod +x ./standalone-bundle.sh
+
+          # ✅ 运行时补丁：standalone 输出里通常没有 ./.next 目录，导致 mv 失败
+          # 在 mv ../static/ ./.next/static 之前插入 mkdir -p ./.next
+          sed -i 's#^mv \.\./static/ \./\.next/static#mkdir -p ./.next\nmv ../static/ ./.next/static#' ./standalone-bundle.sh
+
           sh ./standalone-bundle.sh
           cd ../..
           test -f assets/release.zip
