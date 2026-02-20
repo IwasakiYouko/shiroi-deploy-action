@@ -126,9 +126,52 @@ jobs:
           cd apps/web
           chmod +x ./standalone-bundle.sh
 
-          # ✅ 运行时补丁：standalone 输出里通常没有 ./.next 目录，导致 mv 失败
-          # 在 mv ../static/ ./.next/static 之前插入 mkdir -p ./.next
-          sed -i 's#^mv \.\./static/ \./\.next/static#mkdir -p ./.next\nmv ../static/ ./.next/static#' ./standalone-bundle.sh
+          # ✅ 运行时补丁 1：standalone 输出里通常没有 ./.next 目录，导致 mv 失败
+          # ✅ 运行时补丁 2：ecosystem.standalone.config.cjs 不存在时，fallback 或生成最小 pm2 配置
+          python - <<'PY'
+          from pathlib import Path
+
+          p = Path("standalone-bundle.sh")
+          s = p.read_text(encoding="utf-8")
+
+          # Patch 1: ensure ./.next exists before moving static
+          target = "mv ../static/ ./.next/static"
+          if target in s and "mkdir -p ./.next" not in s:
+            s = s.replace(target, "mkdir -p ./.next\n" + target)
+
+          # Patch 2: replace hard-coded cp ecosystem.standalone.config.cjs with fallback / generate
+          old = "cp $CWD/ecosystem.standalone.config.cjs ./ecosystem.config.js"
+          if old in s:
+            replacement = r"""if [ -f "$CWD/ecosystem.standalone.config.cjs" ]; then
+            cp "$CWD/ecosystem.standalone.config.cjs" ./ecosystem.config.js
+          elif [ -f "$CWD/ecosystem.config.cjs" ]; then
+            cp "$CWD/ecosystem.config.cjs" ./ecosystem.config.js
+          elif [ -f "$CWD/ecosystem.config.js" ]; then
+            cp "$CWD/ecosystem.config.js" ./ecosystem.config.js
+          else
+            cat > ./ecosystem.config.js <<'EOF'
+          module.exports = {
+            apps: [
+              {
+                name: "shiro",
+                script: "server.js",
+                cwd: __dirname,
+                instances: 1,
+                exec_mode: "fork",
+                env: {
+                  NODE_ENV: "production"
+                }
+              }
+            ]
+          }
+          EOF
+          fi
+          """
+            s = s.replace(old, replacement)
+
+          p.write_text(s, encoding="utf-8")
+          print("Patched standalone-bundle.sh successfully.")
+          PY
 
           sh ./standalone-bundle.sh
           cd ../..
