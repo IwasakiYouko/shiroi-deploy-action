@@ -121,6 +121,7 @@ jobs:
           pnpm install --frozen-lockfile || pnpm install --no-frozen-lockfile
 
       # ✅ 关键：只构建 apps/web，避免 turbo build 把 shiro-types 等 workspace 一起构建导致失败
+      # 同时打包 assets/release.zip（zip 内部为 workdir 根目录结构：server.js/.next/public...）
       - name: Build web app only + package assets/release.zip
         shell: bash
         run: |
@@ -135,7 +136,6 @@ jobs:
           fi
 
           echo "== Build apps/web =="
-          # 优先跑 apps/web 自己的 build script（如果存在）
           if pnpm -C "$APP_DIR" run | grep -qE '(^|\s)build($|\s)'; then
             pnpm -C "$APP_DIR" run build
           else
@@ -144,7 +144,6 @@ jobs:
           fi
 
           echo "== Package release.zip =="
-          # 你的服务器端部署脚本使用 standalone/server.js，因此必须有 standalone 产物
           if [ ! -d "$APP_DIR/.next/standalone" ]; then
             echo "ERROR: $APP_DIR/.next/standalone not found."
             echo "This means Next.js is not producing standalone output."
@@ -154,32 +153,32 @@ jobs:
             exit 1
           fi
 
-          rm -rf standalone assets
-          mkdir -p standalone/.next assets
+          rm -rf bundle assets
+          mkdir -p bundle/.next assets
 
           echo "== Copy standalone server =="
-          cp -R "$APP_DIR/.next/standalone/"* standalone/
+          cp -R "$APP_DIR/.next/standalone/"* bundle/
 
           echo "== Copy static assets =="
           if [ -d "$APP_DIR/.next/static" ]; then
-            mkdir -p standalone/.next
-            cp -R "$APP_DIR/.next/static" standalone/.next/static
+            mkdir -p bundle/.next
+            cp -R "$APP_DIR/.next/static" bundle/.next/static
           fi
 
           echo "== Copy public =="
           if [ -d "$APP_DIR/public" ]; then
-            cp -R "$APP_DIR/public" standalone/public
+            cp -R "$APP_DIR/public" bundle/public
           fi
 
           echo "== Copy ecosystem.config.js if exists (prefer apps/web) =="
           if [ -f "$APP_DIR/ecosystem.config.js" ]; then
-            cp "$APP_DIR/ecosystem.config.js" standalone/ecosystem.config.js
+            cp "$APP_DIR/ecosystem.config.js" bundle/ecosystem.config.js
           elif [ -f "ecosystem.config.js" ]; then
-            cp ecosystem.config.js standalone/ecosystem.config.js
+            cp ecosystem.config.js bundle/ecosystem.config.js
           fi
 
-          echo "== Zip to assets/release.zip =="
-          (cd standalone && zip -qr ../assets/release.zip .)
+          echo "== Zip to assets/release.zip (root layout) =="
+          (cd bundle && zip -qr ../assets/release.zip .)
 
           test -f assets/release.zip
           ls -lh assets/release.zip
@@ -227,6 +226,7 @@ jobs:
           source: "release.zip"
           target: "/tmp/shiro"
 
+      # ✅ 方案A：服务器端按“zip 解压后直接在 workdir 根目录”处理（不再使用 workdir/standalone/ 前缀）
       - name: Exec deploy script with SSH
         uses: appleboy/ssh-action@master
         with:
@@ -254,20 +254,29 @@ jobs:
             cd $workdir
             unzip -qq -o $workdir/release.zip
 
-            rm -rf $workdir/standalone/.env
-            ln -s $HOME/mx-space/shiro/.env $workdir/standalone/.env
+            # zip 解压后内容直接位于 $workdir（server.js/.next/public...）
+            rm -rf $workdir/.env
+            ln -s $HOME/mx-space/shiro/.env $workdir/.env
 
             export NEXT_SHARP_PATH=$(npm root -g)/sharp
 
+            # copy ecosystem.config.js to basedir if not exists
             if [ ! -f $basedir/ecosystem.config.js ]; then
-              cp $workdir/standalone/ecosystem.config.js $basedir/ecosystem.config.js
+              if [ -f $workdir/ecosystem.config.js ]; then
+                cp $workdir/ecosystem.config.js $basedir/ecosystem.config.js
+              else
+                echo "ERROR: ecosystem.config.js not found in workdir"
+                ls -la $workdir
+                exit 1
+              fi
             fi
 
-            ln -sf $workdir/standalone/server.js $basedir/server.js
+            # symlink workdir node entry file to basedir
+            ln -sf $workdir/server.js $basedir/server.js
 
-            mkdir -p $workdir/standalone/.next
-            rm -rf $workdir/standalone/.next/cache
-            ln -sf $basedir/.cache $workdir/standalone/.next/cache
+            mkdir -p $workdir/.next
+            rm -rf $workdir/.next/cache
+            ln -sf $basedir/.cache $workdir/.next/cache
 
             cd $basedir
             pm2 reload ecosystem.config.js --update-env
