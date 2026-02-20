@@ -23,7 +23,7 @@ jobs:
   prepare:
     name: Prepare
     runs-on: ubuntu-latest
-    # 只有 push 触发时才检查 head_commit.message，避免其它触发事件不存在 head_commit 导致异常
+    # 只有 push 才判断 head_commit.message，避免 schedule/repository_dispatch 没有 head_commit
     if: ${{ github.event_name != 'push' || github.event.head_commit.message != 'Update hash file' }}
 
     outputs:
@@ -49,7 +49,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          repository: innei-dev/shiroi # upstream repo
+          repository: innei-dev/shiroi
           token: ${{ secrets.GH_PAT }}
           fetch-depth: 0
           lfs: true
@@ -67,7 +67,6 @@ jobs:
           current_hash="$(git rev-parse --short HEAD)"
           echo "File Hash: $file_hash"
           echo "Current Git Hash: $current_hash"
-
           if [ -n "$file_hash" ] && [ "$file_hash" = "$current_hash" ]; then
             echo "Hashes match. Stopping workflow."
             echo "canceled=true" >> "$GITHUB_OUTPUT"
@@ -117,29 +116,41 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y zip
 
-      - name: Install dependencies
+      - name: Install dependencies (repo root)
         run: |
           pnpm install --frozen-lockfile || pnpm install --no-frozen-lockfile
 
-      # 动态生成构建脚本（post.md 中“这里是你的构建脚本”的正确实现方式）
-      - name: Create ci-release-build.sh
+      # ✅ 关键：只构建 apps/web，避免 turbo build 把 shiro-types 等 workspace 一起构建导致失败
+      - name: Build web app only + package assets/release.zip
         shell: bash
         run: |
           set -euo pipefail
 
-          cat > ./ci-release-build.sh << 'EOF'
-          #!/usr/bin/env bash
-          set -euo pipefail
+          APP_DIR="apps/web"
+          if [ ! -d "$APP_DIR" ]; then
+            echo "ERROR: $APP_DIR not found. Repo layout changed."
+            echo "Top-level listing:"
+            ls -la
+            exit 1
+          fi
 
-          echo "== Build =="
-          pnpm run build
+          echo "== Build apps/web =="
+          # 优先跑 apps/web 自己的 build script（如果存在）
+          if pnpm -C "$APP_DIR" run | grep -qE '(^|\s)build($|\s)'; then
+            pnpm -C "$APP_DIR" run build
+          else
+            echo "No build script found in $APP_DIR/package.json, trying 'next build'..."
+            pnpm -C "$APP_DIR" exec next build
+          fi
 
-          # 你的 deploy 脚本会用到 standalone/server.js，所以这里打包 standalone
-          if [ ! -d ".next/standalone" ]; then
-            echo "ERROR: .next/standalone not found."
-            echo "Your upstream build is not producing Next.js standalone output."
-            echo "== .next listing =="
-            ls -la .next || true
+          echo "== Package release.zip =="
+          # 你的服务器端部署脚本使用 standalone/server.js，因此必须有 standalone 产物
+          if [ ! -d "$APP_DIR/.next/standalone" ]; then
+            echo "ERROR: $APP_DIR/.next/standalone not found."
+            echo "This means Next.js is not producing standalone output."
+            echo "== $APP_DIR/.next listing =="
+            ls -la "$APP_DIR/.next" || true
+            echo "You need output: 'standalone' in $APP_DIR/next.config.* (upstream), or you must change server deploy strategy."
             exit 1
           fi
 
@@ -147,21 +158,23 @@ jobs:
           mkdir -p standalone/.next assets
 
           echo "== Copy standalone server =="
-          cp -R .next/standalone/* standalone/
+          cp -R "$APP_DIR/.next/standalone/"* standalone/
 
           echo "== Copy static assets =="
-          if [ -d ".next/static" ]; then
+          if [ -d "$APP_DIR/.next/static" ]; then
             mkdir -p standalone/.next
-            cp -R .next/static standalone/.next/static
+            cp -R "$APP_DIR/.next/static" standalone/.next/static
           fi
 
           echo "== Copy public =="
-          if [ -d "public" ]; then
-            cp -R public standalone/public
+          if [ -d "$APP_DIR/public" ]; then
+            cp -R "$APP_DIR/public" standalone/public
           fi
 
-          echo "== Copy ecosystem.config.js if exists =="
-          if [ -f "ecosystem.config.js" ]; then
+          echo "== Copy ecosystem.config.js if exists (prefer apps/web) =="
+          if [ -f "$APP_DIR/ecosystem.config.js" ]; then
+            cp "$APP_DIR/ecosystem.config.js" standalone/ecosystem.config.js
+          elif [ -f "ecosystem.config.js" ]; then
             cp ecosystem.config.js standalone/ecosystem.config.js
           fi
 
@@ -170,13 +183,6 @@ jobs:
 
           test -f assets/release.zip
           ls -lh assets/release.zip
-          EOF
-
-          chmod +x ./ci-release-build.sh
-
-      - name: Build project
-        run: |
-          bash ./ci-release-build.sh
 
       - name: Cache Build Artifacts
         id: cache-primes
