@@ -31,8 +31,10 @@ jobs:
 
       - name: Read HASH_FILE content
         id: read_hash
+        shell: bash
         run: |
-          content=$(cat "${{ env.HASH_FILE }}" 2>/dev/null || true)
+          set -euo pipefail
+          content="$(cat "${{ env.HASH_FILE }}" 2>/dev/null || true)"
           echo "hash_content=$content" >> "$GITHUB_OUTPUT"
 
   check:
@@ -51,22 +53,29 @@ jobs:
           lfs: true
 
       - name: Checkout LFS objects
-        run: git lfs checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          git lfs checkout
 
       - name: Compare with last built hash
         id: compare
         env:
           FILE_HASH: ${{ needs.prepare.outputs.hash_content }}
+        shell: bash
         run: |
-          file_hash="$FILE_HASH"
+          set -euo pipefail
+          file_hash="${FILE_HASH:-}"
           current_hash="$(git rev-parse --short HEAD)"
           echo "File Hash: $file_hash"
           echo "Current Git Hash: $current_hash"
+
           if [ -n "$file_hash" ] && [ "$file_hash" = "$current_hash" ]; then
             echo "Hashes match. Stopping workflow."
             echo "canceled=true" >> "$GITHUB_OUTPUT"
           else
             echo "Hashes do not match. Continuing workflow."
+            echo "canceled=false" >> "$GITHUB_OUTPUT"
           fi
 
   build:
@@ -93,7 +102,10 @@ jobs:
           lfs: true
 
       - name: Checkout LFS objects
-        run: git lfs checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          git lfs checkout
 
       - uses: pnpm/action-setup@v2
         with:
@@ -108,10 +120,12 @@ jobs:
       - uses: jongwooo/next-cache@v1
 
       - name: Install dependencies
+        shell: bash
         run: |
+          set -euo pipefail
           pnpm install --frozen-lockfile || pnpm install --no-frozen-lockfile
 
-      # NOTE: 保持你原有逻辑：构建阶段不写入/不复制 .env
+      # NOTE: 保持原逻辑：构建阶段不写入/不复制 .env
       # 运行时由服务器侧 ln -s "$HOME/mx-space/shiro/.env" 注入 standalone/.env
 
       - name: Build and package (produce assets/release.zip)
@@ -119,59 +133,20 @@ jobs:
           NODE_OPTIONS: --max_old_space_size=4096
           NEXT_TELEMETRY_DISABLED: "1"
           CI: "true"
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
           pnpm --filter @shiro/web build:ci
 
           cd apps/web
           chmod +x ./standalone-bundle.sh
 
-          # ✅ 运行时补丁 1：standalone 输出里通常没有 ./.next 目录，导致 mv 失败
-          # ✅ 运行时补丁 2：ecosystem.standalone.config.cjs 不存在时，fallback 或生成最小 pm2 配置
-          python - <<'PY'
-          from pathlib import Path
-
-          p = Path("standalone-bundle.sh")
-          s = p.read_text(encoding="utf-8")
-
-          # Patch 1: ensure ./.next exists before moving static
-          target = "mv ../static/ ./.next/static"
-          if target in s and "mkdir -p ./.next" not in s:
-            s = s.replace(target, "mkdir -p ./.next\n" + target)
-
-          # Patch 2: replace hard-coded cp ecosystem.standalone.config.cjs with fallback / generate
-          old = "cp $CWD/ecosystem.standalone.config.cjs ./ecosystem.config.js"
-          if old in s:
-            replacement = r"""if [ -f "$CWD/ecosystem.standalone.config.cjs" ]; then
-            cp "$CWD/ecosystem.standalone.config.cjs" ./ecosystem.config.js
-          elif [ -f "$CWD/ecosystem.config.cjs" ]; then
-            cp "$CWD/ecosystem.config.cjs" ./ecosystem.config.js
-          elif [ -f "$CWD/ecosystem.config.js" ]; then
-            cp "$CWD/ecosystem.config.js" ./ecosystem.config.js
-          else
-            cat > ./ecosystem.config.js <<'EOF'
-          module.exports = {
-            apps: [
-              {
-                name: "shiro",
-                script: "server.js",
-                cwd: __dirname,
-                instances: 1,
-                exec_mode: "fork",
-                env: {
-                  NODE_ENV: "production"
-                }
-              }
-            ]
-          }
-          EOF
+          # ✅ 运行时补丁：standalone 输出里通常没有 ./.next 目录，导致 mv 失败
+          # 只在目标 mv 行存在且尚未插入 mkdir 的情况下打补丁，避免重复插入
+          if grep -qE '^mv \.\./static/ \./\.next/static' ./standalone-bundle.sh && \
+             ! grep -qE '^mkdir -p \./\.next$' ./standalone-bundle.sh; then
+            sed -i 's#^mv \.\./static/ \./\.next/static#mkdir -p ./.next\nmv ../static/ ./.next/static#' ./standalone-bundle.sh
           fi
-          """
-            s = s.replace(old, replacement)
-
-          p.write_text(s, encoding="utf-8")
-          print("Patched standalone-bundle.sh successfully.")
-          PY
 
           sh ./standalone-bundle.sh
           cd ../..
@@ -185,9 +160,11 @@ jobs:
 
       - name: Store artifact commit version
         id: store
+        shell: bash
         run: |
-          sha_short=$(git rev-parse --short HEAD)
-          branch_name=$(git rev-parse --abbrev-ref HEAD)
+          set -euo pipefail
+          sha_short="$(git rev-parse --short HEAD)"
+          branch_name="$(git rev-parse --abbrev-ref HEAD)"
           echo "sha_short=$sha_short" >> "$GITHUB_OUTPUT"
           echo "branch=$branch_name" >> "$GITHUB_OUTPUT"
 
@@ -201,10 +178,12 @@ jobs:
         with:
           path: assets
           key: ${{ github.run_number }}-release
+          fail-on-cache-miss: true
 
       - name: Move assets to root
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
           mv assets/release.zip release.zip
 
       - name: copy file via ssh
@@ -219,7 +198,7 @@ jobs:
           target: "/tmp/shiro"
 
       - name: Exec deploy script with SSH
-        uses: appleboy/ssh-action@master
+        uses: appleboy/ssh-action@v1.0.3
         with:
           command_timeout: 5m
           host: ${{ secrets.HOST }}
@@ -228,7 +207,7 @@ jobs:
           key: ${{ secrets.KEY }}
           port: ${{ secrets.PORT }}
           script: |
-            set -e
+            set -euo pipefail
             export NVM_DIR=~/.nvm
             source ~/.nvm/nvm.sh
             source $HOME/.bashrc
@@ -244,6 +223,7 @@ jobs:
 
             cd "$workdir"
             unzip -qq -o "$workdir/release.zip"
+
             rm -rf "$workdir/standalone/.env"
             ln -s "$HOME/mx-space/shiro/.env" "$workdir/standalone/.env"
 
@@ -266,7 +246,9 @@ jobs:
             echo "Deployed successfully"
 
       - name: After deploy script
+        shell: bash
         run: |
+          set -euo pipefail
           ${{ secrets.AFTER_DEPLOY_SCRIPT }}
 
   store:
@@ -283,10 +265,15 @@ jobs:
       - name: Write hash to file
         env:
           SHA_SHORT: ${{ needs.build.outputs.sha_short }}
-        run: echo "$SHA_SHORT" > "${{ env.HASH_FILE }}"
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "$SHA_SHORT" > "${{ env.HASH_FILE }}"
 
       - name: Commit files
+        shell: bash
         run: |
+          set -euo pipefail
           git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
           git add "${{ env.HASH_FILE }}"
