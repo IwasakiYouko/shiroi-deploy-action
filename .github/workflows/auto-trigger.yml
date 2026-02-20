@@ -1,0 +1,157 @@
+name: Auto trigger deploy (upstream main commit or every 3 days, no commits)
+
+on:
+  schedule:
+    # 每天检查一次（cron 为 UTC）
+    - cron: "0 3 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: auto-trigger
+  cancel-in-progress: false
+
+jobs:
+  check-and-dispatch:
+    runs-on: ubuntu-latest
+    env:
+      # 对齐 deploy.yml
+      HASH_FILE: build_hash
+      UPSTREAM_REPO: innei-dev/shiroi
+      UPSTREAM_BRANCH: main
+
+      # 对齐你的 deploy 工作流文件名
+      DEPLOY_WORKFLOW_FILE: deploy.yml
+
+      # 3 天
+      FORCE_INTERVAL_SECONDS: "259200"
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Read local hash (last deployed upstream short sha)
+        id: localhash
+        run: |
+          set -euo pipefail
+          if [ -f "${HASH_FILE}" ]; then
+            v="$(cat "${HASH_FILE}" | tr -d '\n' || true)"
+          else
+            v=""
+          fi
+          echo "hash=$v" >> "$GITHUB_OUTPUT"
+          echo "Local ${HASH_FILE}: $v"
+
+      - name: Fetch upstream main latest commit short sha
+        id: upstream
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/${UPSTREAM_REPO}/commits/${UPSTREAM_BRANCH}"
+          sha="$(curl -fsSL \
+            -H "Authorization: token ${GH_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            "$api" | jq -r '.sha')"
+
+          if [ -z "$sha" ] || [ "$sha" = "null" ]; then
+            echo "Failed to fetch upstream sha"
+            exit 1
+          fi
+
+          short="${sha:0:7}"
+          echo "short=$short" >> "$GITHUB_OUTPUT"
+          echo "Upstream short sha: $short"
+
+      - name: Get last deploy workflow run time (epoch)
+        id: lastrun
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # 取 deploy.yml 最近一次成功运行；如果没有成功运行记录，则退化取最近一次运行
+          base="https://api.github.com/repos/${REPO}/actions/workflows/${DEPLOY_WORKFLOW_FILE}/runs"
+          url_success="${base}?per_page=1&status=success"
+          url_latest="${base}?per_page=1"
+
+          created_at="$(curl -fsSL \
+            -H "Authorization: token ${GH_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            "$url_success" | jq -r '.workflow_runs[0].created_at // empty')"
+
+          if [ -z "$created_at" ]; then
+            created_at="$(curl -fsSL \
+              -H "Authorization: token ${GH_PAT}" \
+              -H "Accept: application/vnd.github+json" \
+              "$url_latest" | jq -r '.workflow_runs[0].created_at // empty')"
+          fi
+
+          if [ -z "$created_at" ]; then
+            # 从未运行过
+            echo "epoch=0" >> "$GITHUB_OUTPUT"
+            echo "No previous deploy workflow runs found."
+            exit 0
+          fi
+
+          # Ubuntu 的 date 支持 -d
+          epoch="$(date -d "$created_at" +%s)"
+          echo "epoch=$epoch" >> "$GITHUB_OUTPUT"
+          echo "Last deploy run created_at: $created_at (epoch=$epoch)"
+
+      - name: Decide whether to dispatch
+        id: decide
+        run: |
+          set -euo pipefail
+
+          local_hash="${{ steps.localhash.outputs.hash }}"
+          upstream_hash="${{ steps.upstream.outputs.short }}"
+          last_epoch="${{ steps.lastrun.outputs.epoch }}"
+
+          now="$(date +%s)"
+
+          should="false"
+          reason="no-change-and-not-due"
+
+          # 1) 上游有变化 => 立刻触发
+          if [ -z "$local_hash" ]; then
+            should="true"
+            reason="no-local-hash-first-run"
+          elif [ "$upstream_hash" != "$local_hash" ]; then
+            should="true"
+            reason="upstream-changed"
+          else
+            # 2) 上游无变化 => 距离上次 deploy 运行 >= 3 天则触发
+            diff=$(( now - last_epoch ))
+            if [ "$last_epoch" -eq 0 ] || [ "$diff" -ge "${FORCE_INTERVAL_SECONDS}" ]; then
+              should="true"
+              reason="interval-3-days"
+            fi
+          fi
+
+          echo "should=$should" >> "$GITHUB_OUTPUT"
+          echo "reason=$reason" >> "$GITHUB_OUTPUT"
+
+          echo "Decision: should=$should reason=$reason"
+          echo "local_hash=$local_hash upstream_hash=$upstream_hash last_epoch=$last_epoch now=$now"
+
+      - name: Dispatch deploy workflow (repository_dispatch)
+        if: steps.decide.outputs.should == 'true'
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          curl -fsSL -X POST \
+            -H "Authorization: token ${GH_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/dispatches" \
+            -d '{"event_type":"trigger-workflow"}'
+
+          echo "Dispatched repository_dispatch: trigger-workflow (${{ steps.decide.outputs.reason }})"
