@@ -17,7 +17,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  PNPM_VERSION: "10" # 已修改：匹配 package.json 中的 pnpm 版本
+  PNPM_VERSION: "10"
   HASH_FILE: build_hash
 
 jobs:
@@ -77,7 +77,7 @@ jobs:
 
     strategy:
       matrix:
-        node-version: [20.x]
+        node-version: [lts/*] # 已修改：使用最新的 LTS (长期支持) 版本
     outputs:
       sha_short: ${{ steps.store.outputs.sha_short }}
       branch: ${{ steps.store.outputs.branch }}
@@ -110,8 +110,8 @@ jobs:
 
       - name: Build project
         run: |
-          # 1. 执行标准的 Turbo 构建命令
-          pnpm run build
+          # 1. 方案一：使用 turbo 过滤，只构建 @shiro/web 及其强依赖，跳过无关包
+          pnpm exec turbo build --filter=@shiro/web...
           
           # 2. 准备打包目录
           mkdir -p assets/standalone
@@ -138,12 +138,6 @@ jobs:
           zip -rq release.zip standalone
           cd ..
 
-      # - uses: actions/upload-artifact@v4
-      #   with:
-      #     name: dist
-      #     path: assets/release.zip
-      #     retention-days: 7
-
       - name: Cache Build Artifacts
         id: cache-primes
         uses: actions/cache/save@v4
@@ -165,10 +159,6 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     steps:
-      # - name: Download artifact
-      #   uses: actions/download-artifact@v4
-      #   with:
-      #     name: dist
 
       - name: Restore cached Build Artifacts
         id: cache-primes-restore
@@ -203,10 +193,10 @@ jobs:
           port: ${{ secrets.PORT }}
           script: |
             set -e
-            export NVM_DIR=~/.nvm #定义.nvm的安装目录，否则终端运行时明明安装了但找不到命令
-            source ~/.nvm/nvm.sh #识别nvm命令，否则可能会报command not found
+            export NVM_DIR=~/.nvm 
+            source ~/.nvm/nvm.sh 
             source $HOME/.bashrc
-            basedir=$HOME/mx-space/shiro #填写你自己希望的路径，因为我的后端文件在mx-space下，所以我希望我的shiro也在mx-space文件夹下，方便管理
+            basedir=$HOME/mx-space/shiro 
             workdir=$basedir/${{ github.run_number }}
             mkdir -p $workdir
             mkdir -p $basedir/.cache
@@ -215,14 +205,13 @@ jobs:
             cd $workdir
             unzip -qq -o $workdir/release.zip
             rm -rf $workdir/standalone/.env
-            ln -s $HOME/mx-space/shiro/.env $workdir/standalone/.env #你的.env文件路径，我存放在mx-space/shiro文件夹内，方便管理
+            ln -s $HOME/mx-space/shiro/.env $workdir/standalone/.env 
             export NEXT_SHARP_PATH=$(npm root -g)/sharp
-            # copy workdir ecosystem.config.js to basedir if not exists
+            
             if [ ! -f $basedir/ecosystem.config.js ]; then
               cp $workdir/standalone/ecosystem.config.js $basedir/ecosystem.config.js
             fi
-            # https://github.com/Unitech/pm2/issues/3054
-            # symlink workdir node entry file to basedir
+            
             ln -sf $workdir/standalone/server.js $basedir/server.js
             mkdir -p $workdir/standalone/.next
             rm -rf $workdir/standalone/.next/cache
@@ -236,7 +225,6 @@ jobs:
       - name: After deploy script
         run: |
           hash=${{ needs.build.outputs.sha_short }}
-          # curl -X "POST" "https://mx.innei.in/api/v2/fn/shiro/new-version-hook" -H 'Content-Type: application/json' -d "{\"hash\": \"$hash\", \"key\": \"\"}"
           ${{ secrets.AFTER_DEPLOY_SCRIPT }}
 
   store:
@@ -247,10 +235,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          persist-credentials: false # otherwise, the token used is the GITHUB_TOKEN, instead of your personal token
-          fetch-depth: 0 # otherwise, you will failed to push refs to dest repo
+          persist-credentials: false
+          fetch-depth: 0 
 
-      # Get the commit version from the build job
       - name: Use outputs from build
         env:
           SHA_SHORT: ${{ needs.build.outputs.sha_short }}
