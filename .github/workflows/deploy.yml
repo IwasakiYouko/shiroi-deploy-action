@@ -17,7 +17,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  PNPM_VERSION: "10"
+  PNPM_VERSION: "^9"
   HASH_FILE: build_hash
 
 jobs:
@@ -77,7 +77,7 @@ jobs:
 
     strategy:
       matrix:
-        node-version: [lts/*] # 已修改：使用最新的 LTS (长期支持) 版本
+        node-version: [20.x]
     outputs:
       sha_short: ${{ steps.store.outputs.sha_short }}
       branch: ${{ steps.store.outputs.branch }}
@@ -110,33 +110,49 @@ jobs:
 
       - name: Build project
         run: |
-          # 1. 方案一：使用 turbo 过滤，只构建 @shiro/web 及其强依赖，跳过无关包
+          # 1. 仅构建主程序，绕过不相关插件的报错
           pnpm exec turbo build --filter=@shiro/web...
           
           # 2. 准备打包目录
           mkdir -p assets/standalone
           
-          # 3. 寻找 Next.js 编译生成的 standalone 目录并复制内容
+          # 3. 提取编译产物并打入防丢包补丁
           STANDALONE_DIR=$(find . -type d -path "*/.next/standalone" | head -n 1)
           if [ -n "$STANDALONE_DIR" ]; then
-            echo "找到 standalone 目录: $STANDALONE_DIR"
             cp -r $STANDALONE_DIR/* assets/standalone/
+            
+            mkdir -p assets/standalone/node_modules
+            STYLED_JSX_PATH=$(find . -path "*/node_modules/styled-jsx" | head -n 1)
+            if [ -n "$STYLED_JSX_PATH" ]; then
+              cp -Lr $STYLED_JSX_PATH assets/standalone/node_modules/
+            fi
+            
+            SWC_HELPERS_PATH=$(find . -path "*/node_modules/@swc/helpers" | head -n 1)
+            if [ -n "$SWC_HELPERS_PATH" ]; then
+              mkdir -p assets/standalone/node_modules/@swc
+              cp -Lr $SWC_HELPERS_PATH assets/standalone/node_modules/@swc/
+            fi
           else
-            echo "错误: 未找到 standalone 目录，请确认 next.config.js 中配置了 output: 'standalone'"
+            echo "Error: 未找到 standalone 目录"
             exit 1
           fi
           
-          # 4. 寻找 ecosystem.config.js 配置文件并复制
+          # 4. 提取生态配置文件
           ECO_FILE=$(find . -name "ecosystem.config.js" | head -n 1)
           if [ -n "$ECO_FILE" ]; then
-            echo "找到配置文件: $ECO_FILE"
             cp $ECO_FILE assets/standalone/
           fi
           
-          # 5. 打包成 release.zip 供后续部署使用
+          # 5. 打包供部署使用
           cd assets
           zip -rq release.zip standalone
           cd ..
+
+      # - uses: actions/upload-artifact@v4
+      #   with:
+      #     name: dist
+      #     path: assets/release.zip
+      #     retention-days: 7
 
       - name: Cache Build Artifacts
         id: cache-primes
@@ -159,6 +175,10 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     steps:
+      # - name: Download artifact
+      #   uses: actions/download-artifact@v4
+      #   with:
+      #     name: dist
 
       - name: Restore cached Build Artifacts
         id: cache-primes-restore
@@ -191,12 +211,13 @@ jobs:
           password: ${{ secrets.PASSWORD }}
           key: ${{ secrets.KEY }}
           port: ${{ secrets.PORT }}
+          #script_stop: true 移除了改行指令，因为该指令已经停止使用了会提示但不影响，不改也行
           script: |
             set -e
-            export NVM_DIR=~/.nvm 
-            source ~/.nvm/nvm.sh 
+            export NVM_DIR=~/.nvm #定义.nvm的安装目录，否则终端运行时明明安装了但找不到命令
+            source ~/.nvm/nvm.sh #识别nvm命令，否则可能会报command not found
             source $HOME/.bashrc
-            basedir=$HOME/mx-space/shiro 
+            basedir=$HOME/mx-space/shiro #填写你自己希望的路径，因为我的后端文件在mx-space下，所以我希望我的shiro也在mx-space文件夹下，方便管理
             workdir=$basedir/${{ github.run_number }}
             mkdir -p $workdir
             mkdir -p $basedir/.cache
@@ -204,18 +225,29 @@ jobs:
             rm -r /tmp/shiro
             cd $workdir
             unzip -qq -o $workdir/release.zip
-            rm -rf $workdir/standalone/.env
-            ln -s $HOME/mx-space/shiro/.env $workdir/standalone/.env 
+            
             export NEXT_SHARP_PATH=$(npm root -g)/sharp
             
+            # 动态获取嵌套后的入口文件路径
+            ACTUAL_SERVER_JS=$(find $workdir/standalone -name "server.js" | grep -v "node_modules" | head -n 1)
+            APP_DIR=$(dirname "$ACTUAL_SERVER_JS")
+            
+            rm -rf $APP_DIR/.env
+            ln -s $HOME/mx-space/shiro/.env $APP_DIR/.env #你的.env文件路径，我存放在mx-space/shiro文件夹内，方便管理
+            
+            # copy workdir ecosystem.config.js to basedir if not exists
             if [ ! -f $basedir/ecosystem.config.js ]; then
-              cp $workdir/standalone/ecosystem.config.js $basedir/ecosystem.config.js
+              cp $APP_DIR/ecosystem.config.js $basedir/ecosystem.config.js || true
             fi
             
-            ln -sf $workdir/standalone/server.js $basedir/server.js
-            mkdir -p $workdir/standalone/.next
-            rm -rf $workdir/standalone/.next/cache
-            ln -sf $basedir/.cache $workdir/standalone/.next/cache
+            # https://github.com/Unitech/pm2/issues/3054
+            # symlink workdir node entry file to basedir
+            ln -sf $ACTUAL_SERVER_JS $basedir/server.js
+            
+            mkdir -p $APP_DIR/.next
+            rm -rf $APP_DIR/.next/cache
+            ln -sf $basedir/.cache $APP_DIR/.next/cache
+            
             cd $basedir
             pm2 reload ecosystem.config.js --update-env
             rm $workdir/release.zip
@@ -225,6 +257,7 @@ jobs:
       - name: After deploy script
         run: |
           hash=${{ needs.build.outputs.sha_short }}
+          # curl -X "POST" "https://mx.innei.in/api/v2/fn/shiro/new-version-hook" -H 'Content-Type: application/json' -d "{\"hash\": \"$hash\", \"key\": \"\"}"
           ${{ secrets.AFTER_DEPLOY_SCRIPT }}
 
   store:
@@ -235,9 +268,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          persist-credentials: false
-          fetch-depth: 0 
+          persist-credentials: false # otherwise, the token used is the GITHUB_TOKEN, instead of your personal token
+          fetch-depth: 0 # otherwise, you will failed to push refs to dest repo
 
+      # Get the commit version from the build job
       - name: Use outputs from build
         env:
           SHA_SHORT: ${{ needs.build.outputs.sha_short }}
