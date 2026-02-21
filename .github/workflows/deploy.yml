@@ -17,7 +17,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  PNPM_VERSION: "^9"
+  PNPM_VERSION: "10" # 已修改：匹配 package.json 中的 pnpm 版本
   HASH_FILE: build_hash
 
 jobs:
@@ -77,7 +77,7 @@ jobs:
 
     strategy:
       matrix:
-        node-version: [lts/*]
+        node-version: [20.x]
     outputs:
       sha_short: ${{ steps.store.outputs.sha_short }}
       branch: ${{ steps.store.outputs.branch }}
@@ -110,7 +110,33 @@ jobs:
 
       - name: Build project
         run: |
-          sh ./ci-release-build.sh
+          # 1. 执行标准的 Turbo 构建命令
+          pnpm run build
+          
+          # 2. 准备打包目录
+          mkdir -p assets/standalone
+          
+          # 3. 寻找 Next.js 编译生成的 standalone 目录并复制内容
+          STANDALONE_DIR=$(find . -type d -path "*/.next/standalone" | head -n 1)
+          if [ -n "$STANDALONE_DIR" ]; then
+            echo "找到 standalone 目录: $STANDALONE_DIR"
+            cp -r $STANDALONE_DIR/* assets/standalone/
+          else
+            echo "错误: 未找到 standalone 目录，请确认 next.config.js 中配置了 output: 'standalone'"
+            exit 1
+          fi
+          
+          # 4. 寻找 ecosystem.config.js 配置文件并复制
+          ECO_FILE=$(find . -name "ecosystem.config.js" | head -n 1)
+          if [ -n "$ECO_FILE" ]; then
+            echo "找到配置文件: $ECO_FILE"
+            cp $ECO_FILE assets/standalone/
+          fi
+          
+          # 5. 打包成 release.zip 供后续部署使用
+          cd assets
+          zip -rq release.zip standalone
+          cd ..
 
       # - uses: actions/upload-artifact@v4
       #   with:
@@ -175,7 +201,6 @@ jobs:
           password: ${{ secrets.PASSWORD }}
           key: ${{ secrets.KEY }}
           port: ${{ secrets.PORT }}
-          #script_stop: true 移除了改行指令，因为该指令已经停止使用了会提示但不影响，不改也行
           script: |
             set -e
             export NVM_DIR=~/.nvm #定义.nvm的安装目录，否则终端运行时明明安装了但找不到命令
